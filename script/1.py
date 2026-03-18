@@ -11,3 +11,5 @@ header = rdd.first()
 data = rdd.filter(lambda row: row != header)
 
 data=data.map(lambda row: row.split(","))
+
+filtered = data.filter(lambda x:x[5] != '' and float((x[5])>25))
