@@ -9,3 +9,5 @@ print(rdd.take(5))
 
 header = rdd.first()
 data = rdd.filter(lambda row: row != header)
+
+data=data.map(lambda row: row.split(","))
