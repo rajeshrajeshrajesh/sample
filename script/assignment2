@@ -1,0 +1,102 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.window import Window
+
+# 1. INIT SPARK
+spark = SparkSession.builder \
+    .appName("ReturnRiskPipeline") \
+     .config("spark.jars", "/Users/as-mac-1261/Downloads/mysql-connector-j-9.6.0/mysql-connector-j-9.6.0.jar") \
+    .getOrCreate()
+
+spark.conf.set("spark.sql.ansi.enabled", "false")
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+
+
+# 2. READ DATA
+orders = spark.read.csv("/Users/as-mac-1261/sample/sample/data/orders_fact.csv", header=True, inferSchema=True)
+returns = spark.read.csv("/Users/as-mac-1261/sample/sample/data/returns_events.csv", header=True, inferSchema=True)
+
+# 3. STANDARDIZE SELLER
+orders = orders.withColumn("seller_id_std", upper(col("seller_id")))
+returns = returns.withColumn("seller_id_std", upper(col("seller_id")))
+
+# 4. FILTER COMPLETED ORDERS
+orders = orders.filter(col("order_status") == "Completed")
+
+# 5. DEDUPLICATE RETURNS
+window = Window.partitionBy("order_item_id").orderBy(col("snapshot_ts").desc())
+returns = returns.withColumn("rn", row_number().over(window))
+returns = returns.filter(col("rn") == 1).drop("rn")
+
+# 6. JOIN
+df = orders.join(returns, ["order_id", "order_item_id"], "left")
+
+df = df.drop(returns["seller_id_std"])
+
+# 7. FEATURES
+df = df.withColumn(
+    "days_to_return",
+    datediff(col("return_date"), col("delivery_date"))
+)
+
+df = df.withColumn(
+    "refund_ratio",
+    col("refund_amount") / col("net_paid_amount")
+)
+
+df = df.withColumn(
+    "is_damaged_claim",
+    when(lower(col("return_reason")).contains("damaged"), 1).otherwise(0)
+)
+
+df = df.withColumn(
+    "is_late_return",
+    when(col("days_to_return") > 7, 1).otherwise(0)
+)
+
+df = df.withColumn(
+    "is_high_refund_case",
+    when(col("refund_ratio") > 0.8, 1).otherwise(0)
+)
+
+# 8. AGGREGATION
+final_df = df.groupBy("seller_id_std") \
+    .agg(
+        count("order_id").alias("total_completed_orders"),
+        count("return_id").alias("total_returned_items"),
+        sum("refund_amount").alias("total_refund_amount"),
+        avg("refund_amount").alias("avg_refund_amount"),
+        avg("is_damaged_claim").alias("damaged_claim_ratio"),
+        avg("is_late_return").alias("late_return_ratio"),
+        sum("is_high_refund_case").alias("high_refund_case_count")
+    )
+
+final_df = final_df.withColumn(
+    "return_rate",
+    col("total_returned_items") / col("total_completed_orders")
+)
+
+# 9. RANK
+final_df = final_df.withColumn(
+    "seller_risk_score",
+    col("return_rate") * 0.5 +
+    col("damaged_claim_ratio") * 0.3 +
+    col("late_return_ratio") * 0.2
+)
+
+final_df = final_df.orderBy(col("seller_risk_score").desc())
+
+# 10. WRITE TO MYSQL
+mysql_url = "jdbc:mysql://localhost:3306/spark"
+
+properties = {
+    "user": "root",
+    "password": "Jeevan@123",
+    "driver": "com.mysql.cj.jdbc.Driver"
+}
+
+final_df.write.jdbc(url=mysql_url, table="seller_risk", mode="overwrite", properties=properties)
+final_df.show()
+# 11. STOP
+spark.stop()
+print("Database conencted successfully")
