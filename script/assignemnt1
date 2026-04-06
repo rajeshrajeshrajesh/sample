@@ -1,0 +1,101 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.window import Window
+
+# 1. INIT SPARK
+spark = SparkSession.builder \
+    .appName("AdSpendPipeline") \
+    .config("spark.jars", "/Users/as-mac-1261/Downloads/mysql-connector-j-9.6.0/mysql-connector-j-9.6.0.jar") \
+    .getOrCreate()
+# ✅ FIXES
+spark.conf.set("spark.sql.ansi.enabled", "false")
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+
+# 2. READ DATA
+df = spark.read.csv("/Users/as-mac-1261/sample/sample/data/ads_camp.csv", header=True, inferSchema=True)
+
+# 3. STANDARDIZE PLATFORM
+df = df.withColumn(
+    "platform_std",
+    when(lower(col("platform")).isin("fb", "facebook", "face book"), "facebook")
+    .when(lower(col("platform")).isin("ig", "insta", "instagram"), "instagram")
+    .otherwise(lower(col("platform")))
+)
+
+df = df.withColumn(
+    "event_dt",
+    coalesce(
+        to_date(col("event_date"), "yyyy-MM-dd"),
+        to_date(col("event_date"), "dd/MM/yyyy"),
+        to_date(col("event_date"), "yyyy/MM/dd")
+    )
+)
+# 4. FILTER ACTIVE + BILLABLE
+df = df.filter(
+    (col("campaign_status") == "ACTIVE") &
+    (col("billing_status") == "Billable")
+)
+
+# 5. DEDUPLICATE
+window = Window.partitionBy("campaign_id", "event_dt").orderBy(col("snapshot_ts").desc())
+df = df.withColumn("rn", row_number().over(window))
+df = df.filter(col("rn") == 1).drop("rn")
+
+# 6. CLEAN DATA
+df = df.fillna({
+    "clicks": 0,
+    "impressions": 0,
+    "conversions": 0,
+    "ad_spend": 0.0,
+    "revenue": 0.0
+})
+
+df = df.filter(col("ad_spend") >= 0)
+
+# 7. METRICS
+df = df.withColumn("ctr", col("clicks") / col("impressions")) \
+       .withColumn("conversion_rate", col("conversions") / col("clicks")) \
+       .withColumn("cost_per_conversion", col("ad_spend") / col("conversions")) \
+       .withColumn("roas", col("revenue") / col("ad_spend"))
+
+# 8. FLAGS
+df = df.withColumn(
+    "leakage_flag", when((col("ad_spend") > 1000) & (col("conversions") == 0), 1).otherwise(0)
+).withColumn(
+    "abnormal_ctr_flag", when(col("ctr") > 0.5, 1).otherwise(0)
+).withColumn(
+    "zero_conversion_spend_flag", when((col("ad_spend") > 0) & (col("conversions") == 0), 1).otherwise(0)
+)
+
+df = df.withColumn(
+    "anomaly_count",
+    col("leakage_flag") + col("abnormal_ctr_flag") + col("zero_conversion_spend_flag")
+)
+
+# 9. AGGREGATION
+final_df = df.groupBy("campaign_id", "platform_std", "event_dt") \
+    .agg(
+        sum("ad_spend").alias("total_spend"),
+        sum("clicks").alias("total_clicks"),
+        sum("impressions").alias("total_impressions"),
+        sum("conversions").alias("total_conversions"),
+        avg("ctr").alias("ctr"),
+        avg("conversion_rate").alias("conversion_rate"),
+        avg("cost_per_conversion").alias("cost_per_conversion"),
+        avg("roas").alias("roas"),
+        sum("anomaly_count").alias("anomaly_count")
+    )
+
+# 10. WRITE TO MYSQL
+mysql_url = "jdbc:mysql://localhost:3306/spark"
+
+properties = {
+    "user": "root",
+    "password": "Jeevan@123",
+    "driver": "com.mysql.cj.jdbc.Driver"
+}
+final_df.show()
+final_df.write.jdbc(url=mysql_url, table="campaign_triage", mode="overwrite", properties=properties)
+
+# 11. STOP
+spark.stop()
