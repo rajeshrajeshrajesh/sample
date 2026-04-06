@@ -2,11 +2,21 @@ name: Run Python Script
 
 on:
   push:
-    branches: [ main ]   # runs when you push code
+    branches: [ main ]
+
+# 🔐 RBAC PERMISSIONS
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   run-script:
+    if: github.actor == 'rajeshrajeshrajesh'
+
     runs-on: ubuntu-latest
+    
+    env:
+      DATABRICKS_TOKEN: ${{ secrets.NEW_SAMPLE_SECRET }}
 
     steps:
       - name: Checkout code
@@ -16,6 +26,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+
 
       - name: Run Python file
         run: |
